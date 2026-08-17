@@ -205,63 +205,77 @@ async function folderRefOf(
     : (await resolveFolder(conn, entitySet, folder)).ref;
 }
 
-interface GoodsLine {
+export interface GoodsLine {
   nomenclatureRef: string;
   quantity: number;
   price: number;
   vatRate: string;
+  /** Содержание строки — печатается в счёте/УПД (для услуг обязательно по смыслу). */
+  content?: string | undefined;
+  /** Счёт доходов: код плана счетов («90.01.2») или готовый Ref_Key. */
+  incomeAccount?: string | undefined;
+  /** Счёт расходов/себестоимости: код («90.02.2») или Ref_Key. */
+  expenseAccount?: string | undefined;
+  /** Исходная строка документа (при правке существующего) — чтобы не терять её поля. */
+  source?: Record<string, unknown> | undefined;
 }
-type LineAccountsFor = (nomRef: string, vatRate: string) => Record<string, string>;
+type LineAccountsFor = (line: GoodsLine) => Record<string, string>;
+
+/** Счета в строке не заполняются (счёт поставщика, счёт покупателю — проводок нет). */
+const noAccounts: LineAccountsFor = () => ({});
 
 const lineSum = (l: GoodsLine): number => Math.round(l.quantity * l.price * 100) / 100;
 const rowsTotal = (rows: Array<Record<string, unknown>>): number =>
   Math.round(rows.reduce((s, r) => s + (r["Сумма"] as number), 0) * 100) / 100;
 
-/** Строки табличной части «Товары» для поступления/реализации (Номенклатура_Key + счета). */
-function buildGoodsRows(
+/**
+ * Поля исходной строки, которые НЕ переносим: считаем заново (иначе после смены
+ * количества/цены останется старая сумма НДС) либо это служебная ссылка.
+ */
+const NOT_CARRIED_ROW_FIELDS = ["LineNumber", "Сумма", "СуммаНДС", "СуммаСНДС", "Ref_Key"] as const;
+
+/**
+ * Прочие поля исходной строки (номенклатурная группа, ГТД, страна происхождения,
+ * субконто) — переносим как есть: мы ими не управляем, но терять их нельзя.
+ */
+export function carriedRowFields(l: GoodsLine): Record<string, unknown> {
+  if (!l.source) return {};
+  const out: Record<string, unknown> = { ...l.source };
+  for (const f of NOT_CARRIED_ROW_FIELDS) delete out[f];
+  return out;
+}
+
+/** Строки табличной части «Товары»/«Услуги» для поступления/реализации (Номенклатура_Key + счета). */
+export function buildGoodsRows(
   lines: GoodsLine[],
   lineAccountsFor: LineAccountsFor,
 ): Array<Record<string, unknown>> {
   return lines.map((l, i) =>
     clean({
+      ...carriedRowFields(l),
       LineNumber: i + 1,
       Номенклатура_Key: l.nomenclatureRef,
+      // Только когда задано: иначе затёрли бы содержание, перенесённое из исходной строки.
+      ...(l.content === undefined ? {} : { Содержание: l.content }),
       Количество: l.quantity,
       Цена: l.price,
       Сумма: lineSum(l),
       СтавкаНДС: l.vatRate,
-      ...lineAccountsFor(l.nomenclatureRef, l.vatRate),
+      ...lineAccountsFor(l),
     }),
   );
 }
 
 /** Строки «Товары» для счёта покупателю (полиморфная ссылка Номенклатура+_Type). */
-function buildInvoiceRows(lines: GoodsLine[]): Array<Record<string, unknown>> {
+export function buildInvoiceRows(lines: GoodsLine[]): Array<Record<string, unknown>> {
   return lines.map((l, i) =>
     clean({
+      ...carriedRowFields(l),
       LineNumber: i + 1,
       Номенклатура: l.nomenclatureRef,
       Номенклатура_Type: NOMENCLATURE_TYPE,
-      Количество: l.quantity,
-      Цена: l.price,
-      Сумма: lineSum(l),
-      СтавкаНДС: l.vatRate,
-    }),
-  );
-}
-
-/** Строка счёта поставщика: товар/услуга + опц. содержание (для услуг типа доставки). */
-interface SupplierLine extends GoodsLine {
-  content?: string | undefined;
-}
-
-/** Строки ТЧ «Товары» счёта на оплату поставщика (Номенклатура_Key + Содержание, без счетов). */
-function buildSupplierRows(lines: SupplierLine[]): Array<Record<string, unknown>> {
-  return lines.map((l, i) =>
-    clean({
-      LineNumber: i + 1,
-      Номенклатура_Key: l.nomenclatureRef,
-      Содержание: l.content,
+      // Только когда задано: иначе затёрли бы содержание, перенесённое из исходной строки.
+      ...(l.content === undefined ? {} : { Содержание: l.content }),
       Количество: l.quantity,
       Цена: l.price,
       Сумма: lineSum(l),
@@ -337,15 +351,66 @@ async function resolveLineAccounts(
 }
 
 /**
+ * Делит заданные пользователем счета на готовые ссылки (GUID — берём как есть,
+ * нормализуя фигурные скобки) и коды плана счетов, которые надо найти в базе.
+ * Ключ карты и элементы codes — исходное значение после trim.
+ */
+export function splitAccountRefs(values: Array<string | undefined>): {
+  refs: Map<string, string>;
+  codes: string[];
+} {
+  const refs = new Map<string, string>();
+  const codes = new Set<string>();
+  for (const v of values) {
+    const t = v?.trim();
+    if (!t) continue;
+    if (GUID_RE.test(t)) refs.set(t, t.replace(/[{}]/g, ""));
+    else codes.add(t);
+  }
+  return { refs, codes: [...codes] };
+}
+
+/**
+ * Резолвит заданные пользователем счета: код плана счетов («90.01.2») → Ref_Key,
+ * готовый GUID — как есть. Все коды одним запросом; ключ карты — исходная строка
+ * после trim. Неизвестный код — ошибка, чтобы не записать документ «мимо» счёта.
+ */
+async function resolveAccountOverrides(
+  conn: Connection,
+  values: Array<string | undefined>,
+): Promise<Map<string, string>> {
+  const { refs, codes } = splitAccountRefs(values);
+  if (codes.length === 0) return refs;
+  const found = await accountsByCode(conn, codes);
+  for (const c of codes) {
+    const ref = found.get(c);
+    if (!ref)
+      throw new Error(
+        `Счёт «${c}» не найден в плане счетов «Хозрасчётный». Укажите код точно как в 1С (напр. 90.01.2) или Ref_Key счёта.`,
+      );
+    refs.set(c, ref);
+  }
+  return refs;
+}
+
+/** Счета учёта, заданные на уровне документа (применяются ко всем строкам). */
+interface DocAccounts {
+  income?: string | undefined;
+  expense?: string | undefined;
+}
+
+/**
  * Готовит счета учёта для товарного документа: счёт расчётов (шапка) и функцию
  * счетов строки по номенклатуре. kind различает поступление (Дт 41 Кт 60) и
- * реализацию (Дт 62 Кт 90, Дт 90 Кт 41).
+ * реализацию (Дт 62 Кт 90, Дт 90 Кт 41). Приоритет счетов доходов/расходов:
+ * строка → документ → регистр «Счета учёта номенклатуры» → коды по умолчанию.
  */
 async function goodsAccounts(
   conn: Connection,
   orgKey: string,
   lines: GoodsLine[],
   kind: "purchase" | "shipment" | "service",
+  docAccounts?: DocAccounts,
 ): Promise<{ settlement?: string | undefined; lineAccountsFor: LineAccountsFor }> {
   const nomRefs = lines.map((l) => l.nomenclatureRef);
   if (kind === "purchase") {
@@ -357,11 +422,11 @@ async function goodsAccounts(
     const accMap = await resolveLineAccounts(conn, orgKey, nomRefs, defaults);
     return {
       settlement: pickAccount(codes, "60.01", "60"),
-      lineAccountsFor: (nomRef, vat) => {
-        const a = accMap.get(nomRef);
+      lineAccountsFor: (l) => {
+        const a = accMap.get(l.nomenclatureRef);
         return clean({
           СчетУчета_Key: a?.goods,
-          ...(vat !== "БезНДС" ? { СчетУчетаНДС_Key: a?.incomingVat } : {}),
+          ...(l.vatRate !== "БезНДС" ? { СчетУчетаНДС_Key: a?.incomingVat } : {}),
         }) as Record<string, string>;
       },
     };
@@ -385,17 +450,26 @@ async function goodsAccounts(
     outgoingVat: pickAccount(codes, "90.03"),
   };
   const accMap = await resolveLineAccounts(conn, orgKey, nomRefs, defaults);
+  // Переопределения (коды/GUID) резолвим одним запросом на весь документ.
+  const overrides = await resolveAccountOverrides(conn, [
+    docAccounts?.income,
+    docAccounts?.expense,
+    ...lines.flatMap((l) => [l.incomeAccount, l.expenseAccount]),
+  ]);
+  const ref = (v: string | undefined): string | undefined => overrides.get(v?.trim() ?? "");
+  const docIncome = ref(docAccounts?.income);
+  const docExpense = ref(docAccounts?.expense);
   return {
     settlement: pickAccount(codes, "62.01", "62"),
-    lineAccountsFor: (nomRef, vat) => {
-      const a = accMap.get(nomRef);
-      const vatField = vat !== "БезНДС" ? { СчетУчетаНДСПоРеализации_Key: a?.outgoingVat } : {};
+    lineAccountsFor: (l) => {
+      const a = accMap.get(l.nomenclatureRef);
+      const vatField = l.vatRate !== "БезНДС" ? { СчетУчетаНДСПоРеализации_Key: a?.outgoingVat } : {};
       // Услуги — без счёта учёта 41 (нет склада); товары — со счётом учёта.
       const goods = kind === "service" ? {} : { СчетУчета_Key: a?.goods };
       return clean({
         ...goods,
-        СчетДоходов_Key: a?.income,
-        СчетРасходов_Key: a?.expense,
+        СчетДоходов_Key: ref(l.incomeAccount) ?? docIncome ?? a?.income,
+        СчетРасходов_Key: ref(l.expenseAccount) ?? docExpense ?? a?.expense,
         ...vatField,
       }) as Record<string, string>;
     },
@@ -422,6 +496,31 @@ async function goodsOnlyAccounts(
   return (nomRef) => clean({ СчетУчета_Key: accMap.get(nomRef)?.goods }) as Record<string, string>;
 }
 
+const EMPTY_GUID = "00000000-0000-0000-0000-000000000000";
+/** Непустая ссылка строкой; пустой GUID и пустая строка → undefined. */
+const refOrUndefined = (v: unknown): string | undefined => {
+  const s = typeof v === "string" ? v.replace(/[{}']/g, "") : "";
+  return s && s !== EMPTY_GUID ? s : undefined;
+};
+
+/**
+ * Разбирает строку ТЧ документа в GoodsLine, сохраняя исходную строку в source:
+ * при пересборке ТЧ (add/remove/update_document_lines) содержание, счета и прочие
+ * поля строки должны пережить правку, а не обнулиться.
+ */
+export function lineFromRow(r: Record<string, unknown>): GoodsLine {
+  return {
+    nomenclatureRef: String(r["Номенклатура_Key"] ?? r["Номенклатура"] ?? ""),
+    quantity: Number(r["Количество"] ?? 0),
+    price: Number(r["Цена"] ?? 0),
+    vatRate: String(r["СтавкаНДС"] ?? "БезНДС"),
+    content: (r["Содержание"] as string) || undefined,
+    incomeAccount: refOrUndefined(r["СчетДоходов_Key"]),
+    expenseAccount: refOrUndefined(r["СчетРасходов_Key"]),
+    source: r,
+  };
+}
+
 /** Читает документ: организация, проведён ли, и текущие строки «Товары» как GoodsLine[]. */
 async function getDocInfo(
   conn: Connection,
@@ -430,13 +529,11 @@ async function getDocInfo(
 ): Promise<{ orgKey: string; posted: boolean; lines: GoodsLine[] }> {
   const doc = await conn.client.getEntity(`${entitySet}(guid'${guid}')${buildQuery({})}`);
   const rows = (doc["Товары"] as Array<Record<string, unknown>>) ?? [];
-  const lines: GoodsLine[] = rows.map((r) => ({
-    nomenclatureRef: String(r["Номенклатура_Key"] ?? r["Номенклатура"] ?? ""),
-    quantity: Number(r["Количество"] ?? 0),
-    price: Number(r["Цена"] ?? 0),
-    vatRate: String(r["СтавкаНДС"] ?? "БезНДС"),
-  }));
-  return { orgKey: String(doc["Организация_Key"] ?? ""), posted: doc["Posted"] === true, lines };
+  return {
+    orgKey: String(doc["Организация_Key"] ?? ""),
+    posted: doc["Posted"] === true,
+    lines: rows.map(lineFromRow),
+  };
 }
 
 /** Читает документ-основание счёта-фактуры: организация, контрагент, договор, суммы, НДС. */
@@ -488,8 +585,10 @@ async function buildSectionRows(
     const withSum = !inList(DOCUMENTS.transfer); // у перемещения в ТЧ нет суммы
     const rows = lines.map((l, i) =>
       clean({
+        ...carriedRowFields(l),
         LineNumber: i + 1,
         Номенклатура_Key: l.nomenclatureRef,
+        ...(l.content === undefined ? {} : { Содержание: l.content }),
         Количество: l.quantity,
         Цена: l.price,
         ...(withSum ? { Сумма: lineSum(l) } : {}),
@@ -550,6 +649,50 @@ const confirmField = z
     "false (по умолчанию) — только предпросмотр (dry-run), запись НЕ выполняется. " +
       "true — выполнить создание. Сначала всегда показывайте dry-run и получайте согласие пользователя.",
   );
+
+const contentField = z
+  .string()
+  .optional()
+  .describe(
+    "Содержание строки (реквизит «Содержание») — именно этот текст печатается в счёте и УПД. " +
+      "Для услуг заполняйте обязательно, напр. «Услуги согласно приложению № 4 от 01.10.2025 г. " +
+      "к договору № 87 от 01.12.2023 г. за июль 2026 г.». 1С сама это поле НЕ заполняет.",
+  );
+
+const incomeAccountField = z
+  .string()
+  .optional()
+  .describe(
+    "Счёт доходов — код плана счетов как в 1С (напр. «90.01.1» или «90.01.2») либо Ref_Key счёта. " +
+      "Без указания берётся из регистра «Счета учёта номенклатуры», иначе 90.01.1.",
+  );
+
+const expenseAccountField = z
+  .string()
+  .optional()
+  .describe(
+    "Счёт расходов (себестоимости) — код как в 1С (напр. «90.02.1» или «90.02.2») либо Ref_Key. " +
+      "Без указания берётся из регистра «Счета учёта номенклатуры», иначе 90.02.1.",
+  );
+
+/** Базовые поля позиции документа (без счетов учёта). */
+const baseLineShape = {
+  nomenclatureRef: z.string().describe("Ref_Key номенклатуры"),
+  quantity: z.number().positive().describe("Количество"),
+  price: z.number().nonnegative().describe("Цена за единицу"),
+  vatRate: z.enum(VAT_RATES).default("БезНДС").describe("Ставка НДС"),
+  content: contentField,
+};
+
+/** Позиция документа продажи: со счетами доходов/расходов на строку. */
+const saleLine = z.object({
+  ...baseLineShape,
+  incomeAccount: incomeAccountField,
+  expenseAccount: expenseAccountField,
+});
+
+/** Позиция документа закупки: счета доходов/расходов неприменимы. */
+const purchaseLine = z.object(baseLineShape);
 
 /** Убирает undefined-поля, чтобы не слать их в 1С. */
 function clean(obj: Record<string, unknown>): Record<string, unknown> {
@@ -880,6 +1023,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       description:
         "Создаёт счёт на оплату покупателю (документ) с табличной частью «Товары». " +
         "Документ создаётся НЕПРОВЕДЁННЫМ (черновик) — провести можно вручную в 1С или инструментом post_document. " +
+        "Для услуг задавайте content в строке — это «Содержание», именно оно печатается в счёте. " +
         "По умолчанию предпросмотр (dry-run); создание — при confirm=true. " +
         "Контрагент и (опц.) договор — по Ref_Key; позиции — по Ref_Key номенклатуры.",
       inputSchema: {
@@ -889,17 +1033,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         contractRef: z.string().optional().describe("Ref_Key договора (необязательно)"),
         date: z.string().optional().describe("Дата документа YYYY-MM-DD (по умолчанию сегодня)"),
         sumIncludesVat: z.boolean().default(true).describe("Сумма включает НДС"),
-        lines: z
-          .array(
-            z.object({
-              nomenclatureRef: z.string().describe("Ref_Key номенклатуры"),
-              quantity: z.number().positive().describe("Количество"),
-              price: z.number().nonnegative().describe("Цена за единицу"),
-              vatRate: z.enum(VAT_RATES).default("БезНДС").describe("Ставка НДС"),
-            }),
-          )
-          .min(1)
-          .describe("Позиции счёта"),
+        // Счёт на оплату проводок не делает — счета учёта в его строках не нужны.
+        lines: z.array(purchaseLine).min(1).describe("Позиции счёта"),
         confirm: confirmField,
       },
       outputSchema: createResultSchema,
@@ -1084,7 +1219,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
   );
 
   // Общая схема входов для товарных документов (поступление/реализация).
-  const goodsDocInput = {
+  const goodsDocCommon = {
     database: databaseField,
     organization: organizationField,
     counterpartyRef: z.string().describe("Ref_Key контрагента"),
@@ -1092,17 +1227,27 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
     warehouse: z.string().optional().describe("Название склада (если в базе несколько)"),
     date: z.string().optional().describe("Дата документа YYYY-MM-DD (по умолчанию сегодня)"),
     sumIncludesVat: z.boolean().default(true).describe("Сумма включает НДС"),
-    lines: z
-      .array(
-        z.object({
-          nomenclatureRef: z.string().describe("Ref_Key номенклатуры"),
-          quantity: z.number().positive().describe("Количество"),
-          price: z.number().nonnegative().describe("Цена за единицу"),
-          vatRate: z.enum(VAT_RATES).default("БезНДС").describe("Ставка НДС"),
-        }),
-      )
-      .min(1)
-      .describe("Позиции документа"),
+  };
+
+  /** Схема закупки: счета доходов/расходов не применяются (Дт 41/19 Кт 60). */
+  const purchaseDocInput = {
+    ...goodsDocCommon,
+    lines: z.array(purchaseLine).min(1).describe("Позиции документа"),
+    confirm: confirmField,
+  };
+
+  /** Схема продажи: счета доходов/расходов — на документ и (приоритетнее) на строку. */
+  const salesDocInput = {
+    ...goodsDocCommon,
+    incomeAccount: incomeAccountField.describe(
+      "Счёт доходов для ВСЕХ строк документа — код как в 1С (напр. «90.01.2») или Ref_Key. " +
+        "Счёт, заданный в строке, важнее. Без указания — из регистра «Счета учёта номенклатуры», иначе 90.01.1.",
+    ),
+    expenseAccount: expenseAccountField.describe(
+      "Счёт расходов для ВСЕХ строк документа — код как в 1С (напр. «90.02.2») или Ref_Key. " +
+        "Счёт, заданный в строке, важнее. Без указания — из регистра «Счета учёта номенклатуры», иначе 90.02.1.",
+    ),
+    lines: z.array(saleLine).min(1).describe("Позиции документа"),
     confirm: confirmField,
   };
 
@@ -1113,8 +1258,9 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       description:
         "Создаёт документ «Поступление товаров и услуг» (закупка у поставщика) с табличной частью «Товары». " +
         "Документ НЕПРОВЕДЁННЫЙ; провести — вручную в 1С или post_document (тогда 1С сформирует проводки Дт 41/19 Кт 60). " +
+        "Позиции могут нести content (Содержание строки) — для услуг вроде доставки. " +
         "По умолчанию dry-run; создание — при confirm=true. Контрагент — поставщик, договор — вида «СПоставщиком».",
-      inputSchema: goodsDocInput,
+      inputSchema: purchaseDocInput,
       outputSchema: createResultSchema,
     },
     ({
@@ -1177,21 +1323,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         date: z.string().optional().describe("Дата документа YYYY-MM-DD (по умолчанию сегодня)"),
         comment: z.string().optional().describe("Комментарий к документу"),
         sumIncludesVat: z.boolean().default(true).describe("Сумма включает НДС"),
-        lines: z
-          .array(
-            z.object({
-              nomenclatureRef: z.string().describe("Ref_Key номенклатуры"),
-              quantity: z.number().positive().describe("Количество"),
-              price: z.number().nonnegative().describe("Цена за единицу"),
-              vatRate: z.enum(VAT_RATES).default("БезНДС").describe("Ставка НДС"),
-              content: z
-                .string()
-                .optional()
-                .describe("Содержание строки (напр. «Доставка СДЭК») — удобно для услуг"),
-            }),
-          )
-          .min(1)
-          .describe("Позиции счёта (товары и услуги в одной таблице)"),
+        lines: z.array(purchaseLine).min(1).describe("Позиции счёта (товары и услуги в одной таблице)"),
         confirm: confirmField,
       },
       outputSchema: createResultSchema,
@@ -1218,7 +1350,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           "Документ «Счёт на оплату поставщика»",
         );
         const org = await resolveOrg(conn, organization);
-        const rows = buildSupplierRows(lines);
+        const rows = buildGoodsRows(lines, noAccounts);
         const payload = clean({
           Date: odataDate(date ? new Date(`${date}T00:00:00`) : new Date()),
           Posted: false,
@@ -1367,8 +1499,9 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       description:
         "Создаёт документ «Реализация товаров и услуг» (отгрузка покупателю) с табличной частью «Товары». " +
         "Документ НЕПРОВЕДЁННЫЙ; провести — вручную в 1С или post_document (тогда 1С сформирует проводки Дт 62 Кт 90, Дт 90 Кт 41 и др.). " +
+        "Позиции могут нести content (Содержание строки — печатается в УПД) и свои счета доходов/расходов. " +
         "По умолчанию dry-run; создание — при confirm=true. Контрагент — покупатель, договор — вида «СПокупателем».",
-      inputSchema: goodsDocInput,
+      inputSchema: salesDocInput,
       outputSchema: createResultSchema,
     },
     ({
@@ -1379,6 +1512,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       warehouse,
       date,
       sumIncludesVat,
+      incomeAccount,
+      expenseAccount,
       lines,
       confirm,
     }) =>
@@ -1387,7 +1522,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const set = await requireEntity(conn, DOCUMENTS.sales, "Документ «Реализация товаров и услуг»");
         const org = await resolveOrg(conn, organization);
         const warehouseKey = await resolveWarehouse(conn, warehouse);
-        const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "shipment");
+        const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "shipment", {
+          income: incomeAccount,
+          expense: expenseAccount,
+        });
         return createGoodsDoc(
           conn,
           set,
@@ -1420,16 +1558,12 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         entitySet: z.string().describe("Имя документа, напр. Document_РеализацияТоваровУслуг"),
         ref: z.string().describe("Ref_Key документа"),
         lines: z
-          .array(
-            z.object({
-              nomenclatureRef: z.string().describe("Ref_Key номенклатуры"),
-              quantity: z.number().positive().describe("Количество"),
-              price: z.number().nonnegative().describe("Цена за единицу"),
-              vatRate: z.enum(VAT_RATES).default("БезНДС").describe("Ставка НДС"),
-            }),
-          )
+          .array(saleLine)
           .min(1)
-          .describe("Новый полный набор строк (заменяет прежние)"),
+          .describe(
+            "Новый полный набор строк (заменяет прежние — реквизиты старых строк не сохраняются, " +
+              "задавайте content и счета заново)",
+          ),
         confirm: confirmField,
       },
       outputSchema: patchResultSchema,
@@ -1486,10 +1620,21 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         "Создаёт документ «Возврат товаров от покупателя» с табличной частью «Товары». НЕПРОВЕДЁННЫЙ; " +
         "провести — post_document (проводки сторнируют реализацию: Дт 90.02 Кт 41, Дт 62 Кт 90.01 со знаком минус). " +
         "dry-run/confirm. Контрагент — покупатель.",
-      inputSchema: goodsDocInput,
+      inputSchema: salesDocInput,
       outputSchema: createResultSchema,
     },
-    ({ database, organization, counterpartyRef, contractRef, warehouse, date, lines, confirm }) =>
+    ({
+      database,
+      organization,
+      counterpartyRef,
+      contractRef,
+      warehouse,
+      date,
+      incomeAccount,
+      expenseAccount,
+      lines,
+      confirm,
+    }) =>
       guard("write.warehouse.create_return_from_customer", async () => {
         const conn = ctx.db(database);
         const set = await requireEntity(
@@ -1499,7 +1644,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         );
         const org = await resolveOrg(conn, organization);
         const warehouseKey = await resolveWarehouse(conn, warehouse);
-        const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "shipment");
+        const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "shipment", {
+          income: incomeAccount,
+          expense: expenseAccount,
+        });
         const rows = buildGoodsRows(lines, lineAccountsFor);
         const payload = clean({
           Date: odataDate(date ? new Date(`${date}T00:00:00`) : new Date()),
@@ -1524,7 +1672,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         "Создаёт документ «Возврат товаров поставщику» с табличной частью «Товары». НЕПРОВЕДЁННЫЙ; " +
         "провести — post_document (проводки сторнируют поступление: Дт 60 Кт 41/19). dry-run/confirm. " +
         "Контрагент — поставщик.",
-      inputSchema: goodsDocInput,
+      inputSchema: purchaseDocInput,
       outputSchema: createResultSchema,
     },
     ({ database, organization, counterpartyRef, contractRef, warehouse, date, lines, confirm }) =>
@@ -1770,12 +1918,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       }),
   );
 
-  const lineObject = z.object({
-    nomenclatureRef: z.string().describe("Ref_Key номенклатуры"),
-    quantity: z.number().positive().describe("Количество"),
-    price: z.number().nonnegative().describe("Цена за единицу"),
-    vatRate: z.enum(VAT_RATES).default("БезНДС").describe("Ставка НДС"),
-  });
+  const lineObject = saleLine;
 
   server.registerTool(
     "write.document.add_document_line",
@@ -1783,7 +1926,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       title: "Добавить строку в документ",
       description:
         "Добавляет одну позицию в табличную часть «Товары» существующего НЕПРОВЕДЁННОГО документа " +
-        "(счёт/поступление/реализация), сохраняя прежние строки. dry-run/confirm.",
+        "(счёт/поступление/реализация), сохраняя прежние строки со всеми их реквизитами " +
+        "(содержание, счета учёта, номенклатурная группа). dry-run/confirm.",
       inputSchema: {
         database: databaseField,
         entitySet: z.string().describe("Имя документа, напр. Document_РеализацияТоваровУслуг"),
@@ -1862,6 +2006,9 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       description:
         "Создаёт «Реализация (акт, накладная)» с табличной частью УСЛУГИ (без склада/остатков). " +
         "Документ НЕПРОВЕДЁННЫЙ; проводки при проведении Дт 62 Кт 90.01 (без 41). " +
+        "ВАЖНО для услуг: задавайте content в строке — это «Содержание», текст, который печатается " +
+        "в акте и УПД (номер приложения, номер договора, период оказания). 1С его не заполнит. " +
+        "Счета доходов/расходов при необходимости задаются явно (напр. 90.01.2 / 90.02.2). " +
         "dry-run/confirm. Контрагент — покупатель; позиции — услуги-номенклатура.",
       inputSchema: {
         database: databaseField,
@@ -1870,17 +2017,37 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         contractRef: z.string().optional().describe("Ref_Key договора"),
         date: z.string().optional().describe("Дата YYYY-MM-DD (по умолчанию сегодня)"),
         sumIncludesVat: z.boolean().default(true).describe("Сумма включает НДС"),
+        incomeAccount: incomeAccountField.describe(
+          "Счёт доходов для ВСЕХ строк (напр. «90.01.2»); счёт в строке важнее",
+        ),
+        expenseAccount: expenseAccountField.describe(
+          "Счёт расходов для ВСЕХ строк (напр. «90.02.2»); счёт в строке важнее",
+        ),
         lines: z.array(lineObject).min(1).describe("Позиции-услуги"),
         confirm: confirmField,
       },
       outputSchema: createResultSchema,
     },
-    ({ database, organization, counterpartyRef, contractRef, date, sumIncludesVat, lines, confirm }) =>
+    ({
+      database,
+      organization,
+      counterpartyRef,
+      contractRef,
+      date,
+      sumIncludesVat,
+      incomeAccount,
+      expenseAccount,
+      lines,
+      confirm,
+    }) =>
       guard("write.sales.create_act", async () => {
         const conn = ctx.db(database);
         const set = await requireEntity(conn, DOCUMENTS.sales, "Документ «Реализация товаров и услуг»");
         const org = await resolveOrg(conn, organization);
-        const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "service");
+        const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "service", {
+          income: incomeAccount,
+          expense: expenseAccount,
+        });
         const rows = buildGoodsRows(lines, lineAccountsFor);
         const payload = clean({
           Date: odataDate(date ? new Date(`${date}T00:00:00`) : new Date()),
@@ -1919,6 +2086,12 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           ),
         date: z.string().optional().describe("Дата YYYY-MM-DD (по умолчанию сегодня)"),
         sumIncludesVat: z.boolean().default(true).describe("Сумма включает НДС"),
+        incomeAccount: incomeAccountField.describe(
+          "Счёт доходов для ВСЕХ строк (напр. «90.01.2»); счёт в строке важнее",
+        ),
+        expenseAccount: expenseAccountField.describe(
+          "Счёт расходов для ВСЕХ строк (напр. «90.02.2»); счёт в строке важнее",
+        ),
         lines: z.array(lineObject).min(1).describe("Позиции-услуги"),
         confirm: confirmField,
       },
@@ -1932,6 +2105,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       nomenclatureGroupRef,
       date,
       sumIncludesVat,
+      incomeAccount,
+      expenseAccount,
       lines,
       confirm,
     }) =>
@@ -1943,7 +2118,10 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           "Документ «Акт об оказании производственных услуг»",
         );
         const org = await resolveOrg(conn, organization);
-        const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "service");
+        const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "service", {
+          income: incomeAccount,
+          expense: expenseAccount,
+        });
         const grpSet = resolveEntity(CATALOGS.nomenclatureGroups, await conn.available());
         const grpSubconto = grpSet
           ? { Субконто: nomenclatureGroupRef, Субконто_Type: `StandardODATA.${grpSet}` }
@@ -1952,13 +2130,14 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           clean({
             LineNumber: i + 1,
             Номенклатура_Key: l.nomenclatureRef,
+            Содержание: l.content,
             Количество: l.quantity,
             Цена: l.price,
             Сумма: lineSum(l),
             СтавкаНДС: l.vatRate,
             НоменклатурнаяГруппа_Key: nomenclatureGroupRef,
             ...grpSubconto,
-            ...lineAccountsFor(l.nomenclatureRef, l.vatRate),
+            ...lineAccountsFor(l),
           }),
         );
         const payload = clean({
