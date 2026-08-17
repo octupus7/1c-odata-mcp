@@ -3,6 +3,7 @@ import { fetchAll } from "./pagination.js";
 import { contains } from "./query.js";
 import { CATALOGS } from "../config/mapping.js";
 import { requireEntity } from "./publication.js";
+import { InputError } from "../errors.js";
 
 export interface Organization {
   ref: string;
@@ -44,11 +45,11 @@ export async function resolveOrganization(conn: Connection, query: string): Prom
     20,
   );
   if (rows.length === 0) {
-    throw new Error(`Организация "${query}" не найдена. Список — в list_organizations.`);
+    throw new InputError(`Организация "${query}" не найдена. Список — в list_organizations.`);
   }
   if (rows.length > 1) {
     const names = rows.map((r) => String(r["Description"])).join(", ");
-    throw new Error(`Под "${query}" подходит несколько организаций: ${names}. Уточните название.`);
+    throw new InputError(`Под "${query}" подходит несколько организаций: ${names}. Уточните название.`);
   }
   const r = rows[0] as Record<string, unknown>;
   return {
@@ -69,7 +70,7 @@ export async function resolveOrgOrDefault(
   if (organization) return resolveOrganization(conn, organization);
   const orgs = await listOrganizations(conn);
   if (orgs.length === 1) return orgs[0]!;
-  throw new Error(
+  throw new InputError(
     `В базе несколько организаций — укажите organization. Доступные: ${orgs.map((o) => o.name).join(", ")}`,
   );
 }

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { ODataError } from "../odata/errors.js";
 import { NotPublishedError, publicationHelp } from "../odata/publication.js";
 import { AggregateOverflowError } from "../odata/aggregate.js";
+import { InputError } from "../errors.js";
 import { logger } from "../logger.js";
 
 /** Общее поле выбора базы — добавляется во все инструменты. */
@@ -72,6 +73,12 @@ export async function guard(toolName: string, fn: () => Promise<CallToolResult>)
     if (e instanceof NotPublishedError) {
       logger.warn({ tool: toolName, missing: e.missing.map((m) => m.label) }, "not published");
       return fail(publicationHelp(e.missing));
+    }
+    if (e instanceof InputError) {
+      // Неверные аргументы вызова — отдаём текст как есть: это чинится уточнением
+      // запроса, а не разбирательством с сервером.
+      logger.info({ tool: toolName }, e.message);
+      return fail(e.message);
     }
     if (e instanceof AggregateOverflowError) {
       // Громкий, но аккуратный отказ — лучше явная ошибка, чем неполная сумма.

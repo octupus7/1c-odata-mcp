@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { fromHttpStatus } from "../src/odata/errors.js";
+import { fromHttpStatus, ODataError } from "../src/odata/errors.js";
+import { InputError } from "../src/errors.js";
+import { guard, ok } from "../src/tools/_shared.js";
+
+const textOf = (r: { content: Array<{ type: string; text?: string }> }): string =>
+  r.content.map((c) => c.text ?? "").join("\n");
 
 describe("fromHttpStatus — классификация HTTP-ошибок OData", () => {
   it("401 → auth, не повторяется", () => {
@@ -35,5 +40,35 @@ describe("fromHttpStatus — классификация HTTP-ошибок OData"
       },
     });
     expect(fromHttpStatus(500, "url", body).message).toContain("Не удалось записать");
+  });
+});
+
+describe("guard — ошибка ввода отделена от сбоя сервера", () => {
+  it("InputError отдаётся текстом как есть, без «Внутренняя ошибка инструмента»", async () => {
+    const r = await guard("write.sales.create_act", () => {
+      throw new InputError("Счёт «90.01.9» не найден в плане счетов «Хозрасчётный».");
+    });
+    expect(r.isError).toBe(true);
+    expect(textOf(r)).toBe("Счёт «90.01.9» не найден в плане счетов «Хозрасчётный».");
+    expect(textOf(r)).not.toContain("Внутренняя ошибка");
+  });
+
+  it("ODataError по-прежнему помечается видом сбоя", async () => {
+    const r = await guard("read.analytics.get_sales", () => {
+      throw new ODataError({ kind: "auth", message: "Ошибка авторизации" });
+    });
+    expect(textOf(r)).toBe("[auth] Ошибка авторизации");
+  });
+
+  it("непредвиденная ошибка остаётся внутренней — это поломка, а не ввод", async () => {
+    const r = await guard("read.analytics.get_sales", () => {
+      throw new TypeError("x is not a function");
+    });
+    expect(textOf(r)).toContain("Внутренняя ошибка инструмента read.analytics.get_sales");
+  });
+
+  it("успешный вызов проходит насквозь", async () => {
+    const r = await guard("read.system.health_check", () => Promise.resolve(ok({ status: "ok" })));
+    expect(r.isError).toBeUndefined();
   });
 });

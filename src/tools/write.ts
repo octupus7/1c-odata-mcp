@@ -21,6 +21,7 @@ import {
   markForDeletionResultSchema,
   postDocumentResultSchema,
 } from "../schemas/output.js";
+import { InputError } from "../errors.js";
 
 /** Тип ссылки на номенклатуру в табличной части (полиморфная ссылка 1С). */
 const NOMENCLATURE_TYPE = "StandardODATA.Catalog_Номенклатура";
@@ -121,7 +122,7 @@ async function resolveWarehouse(conn: Connection, name: string | undefined): Pro
       5,
     );
     const first = rows[0];
-    if (!first) throw new Error(`Склад "${name}" не найден (см. list_entities / справочник Склады).`);
+    if (!first) throw new InputError(`Склад "${name}" не найден (см. list_entities / справочник Склады).`);
     return String(first["Ref_Key"]);
   }
   const { rows } = await fetchAll(conn.client, set, { select: ["Ref_Key"] }, 2, 2);
@@ -158,7 +159,7 @@ async function resolveCatalogItem(
         )
       ).rows;
   const first = rows[0];
-  if (!first) throw new Error(`${label}: «${query}» не найдено (по коду или наименованию).`);
+  if (!first) throw new InputError(`${label}: «${query}» не найдено (по коду или наименованию).`);
   return {
     ref: String(first["Ref_Key"]),
     code: first["Code"] ? String(first["Code"]) : undefined,
@@ -184,10 +185,10 @@ async function resolveFolder(
     10,
     10,
   );
-  if (rows.length === 0) throw new Error(`Папка «${query}» не найдена в ${entitySet}.`);
+  if (rows.length === 0) throw new InputError(`Папка «${query}» не найдена в ${entitySet}.`);
   if (rows.length > 1) {
     const names = rows.map((r) => String(r["Description"])).join(", ");
-    throw new Error(`Под «${query}» несколько папок: ${names}. Уточните название.`);
+    throw new InputError(`Под «${query}» несколько папок: ${names}. Уточните название.`);
   }
   const r = rows[0] as ODataEntity;
   return { ref: String(r["Ref_Key"]), name: String(r["Description"] ?? "") };
@@ -387,7 +388,7 @@ async function resolveAccountOverrides(
   for (const c of codes) {
     const ref = found.get(c);
     if (!ref)
-      throw new Error(
+      throw new InputError(
         `Счёт «${c}» не найден в плане счетов «Хозрасчётный». Укажите код точно как в 1С (напр. 90.01.2) или Ref_Key счёта.`,
       );
     refs.set(c, ref);
@@ -668,7 +669,7 @@ async function resolveOrgBankAccount(
   if (hits.length === 1) return hits[0]?.ref;
   if (hits.length === 0) {
     const known = accounts.map((a) => a.name).join("; ");
-    throw new Error(
+    throw new InputError(
       `Банковский счёт организации «${q}» не найден.` +
         (known ? ` Есть: ${known}.` : " У организации нет счетов."),
     );
@@ -677,7 +678,7 @@ async function resolveOrgBankAccount(
   const main = await mainOrgBankAccount(conn, orgKey);
   const preferred = hits.find((a) => a.ref === main);
   if (preferred) return preferred.ref;
-  throw new Error(
+  throw new InputError(
     `Под «${q}» подходит несколько счетов организации: ${hits.map((a) => a.name).join("; ")}. Уточните номер счёта.`,
   );
 }

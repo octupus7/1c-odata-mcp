@@ -3,6 +3,7 @@ import { fetchAll } from "./pagination.js";
 import { and, cmp, contains, odataGuid, odataString } from "./query.js";
 import { resolveEntity } from "../config/mapping.js";
 import { requireEntity } from "./publication.js";
+import { InputError } from "../errors.js";
 
 /**
  * Резолверы справочных данных, нужных для записи «богатой» карточки контрагента:
@@ -85,7 +86,7 @@ export async function resolveBankByBik(
     3,
   );
   const first = rows[0];
-  if (!first) throw new Error(`Банк с БИК ${bik} не найден в справочнике «Банки».`);
+  if (!first) throw new InputError(`Банк с БИК ${bik} не найден в справочнике «Банки».`);
   return { ref: String(first["Ref_Key"]), name: String(first["Description"] ?? "") };
 }
 
