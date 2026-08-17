@@ -13,7 +13,7 @@ import {
   type ContactKinds,
 } from "../odata/refdata.js";
 import { fetchAll } from "../odata/pagination.js";
-import { and, buildQuery, cmp, contains, odataGuid, odataString } from "../odata/query.js";
+import { and, buildQuery, cmp, contains, odataString } from "../odata/query.js";
 import type { ODataEntity } from "../types/odata.js";
 import {
   createResultSchema,
@@ -297,6 +297,7 @@ async function createGoodsDoc(
     sumIncludesVat: boolean;
     lines: GoodsLine[];
     settlement?: string | undefined; // СчетУчетаРасчетовСКонтрагентом_Key (шапка)
+    bankAccountKey?: string | undefined; // БанковскийСчетОрганизации_Key (есть у реализации)
     lineAccountsFor: LineAccountsFor; // счета строки
   },
   confirm: boolean,
@@ -310,6 +311,7 @@ async function createGoodsDoc(
     ДоговорКонтрагента_Key: p.contractRef,
     Склад_Key: p.warehouseKey,
     СчетУчетаРасчетовСКонтрагентом_Key: p.settlement,
+    БанковскийСчетОрганизации_Key: p.bankAccountKey,
     СуммаВключаетНДС: p.sumIncludesVat,
     СуммаДокумента: rowsTotal(rows),
     Товары: rows,
@@ -640,24 +642,99 @@ async function buildSectionRows(
   return undefined;
 }
 
-/** Банковский счёт организации (для документов оплаты). По названию или первый. */
+/**
+ * Банковский счёт организации. Приоритет: явный Ref_Key → поиск по названию/номеру →
+ * ОСНОВНОЙ счёт организации → первый по алфавиту. Раньше без названия брался
+ * произвольный счёт (rows[0] без сортировки) — на счёте и в акте печатались
+ * реквизиты не того банка.
+ */
 async function resolveOrgBankAccount(
   conn: Connection,
   orgKey: string,
   query: string | undefined,
 ): Promise<string | undefined> {
-  const set = resolveEntity(CATALOGS.bankAccounts, await conn.available());
-  if (!set) return undefined;
-  // Владелец банковского счёта — полиморфная ссылка Owner (+ Owner_Type), не Owner_Key.
+  const q = query?.trim();
+  if (q && GUID_RE.test(q)) return q.replace(/[{}]/g, "");
+  if (!q) {
+    const main = await mainOrgBankAccount(conn, orgKey);
+    if (main) return main;
+    const [first] = await orgBankAccounts(conn, orgKey);
+    // Подбор не удался — не критично: 1С подставит счёт организации по умолчанию.
+    return first?.ref;
+  }
+  const accounts = await orgBankAccounts(conn, orgKey);
+  const needle = q.toLowerCase();
+  const hits = accounts.filter((a) => a.name.toLowerCase().includes(needle) || a.number.includes(q));
+  if (hits.length === 1) return hits[0]?.ref;
+  if (hits.length === 0) {
+    const known = accounts.map((a) => a.name).join("; ");
+    throw new Error(
+      `Банковский счёт организации «${q}» не найден.` +
+        (known ? ` Есть: ${known}.` : " У организации нет счетов."),
+    );
+  }
+  // Несколько совпадений: основной среди них — берём его, иначе просим уточнить.
+  const main = await mainOrgBankAccount(conn, orgKey);
+  const preferred = hits.find((a) => a.ref === main);
+  if (preferred) return preferred.ref;
+  throw new Error(
+    `Под «${q}» подходит несколько счетов организации: ${hits.map((a) => a.name).join("; ")}. Уточните номер счёта.`,
+  );
+}
+
+/**
+ * Банковские счета организации списком.
+ *
+ * Владелец счёта — полиморфная ссылка Owner (+ Owner_Type). Сравнивать саму Owner
+ * в $filter 1С не даёт: «Нельзя сравнивать поля неограниченной длины и поля
+ * несовместимых типов» (HTTP 500). Зато Owner_Type — обычная строка, ею и сужаем
+ * выборку до счетов организаций, а конкретного владельца сверяем на клиенте.
+ * Отбор по названию тоже клиентский: substringof по Description 1С отклоняет
+ * по той же причине.
+ */
+async function orgBankAccounts(
+  conn: Connection,
+  orgKey: string,
+): Promise<Array<{ ref: string; name: string; number: string }>> {
+  const available = await conn.available();
+  const set = resolveEntity(CATALOGS.bankAccounts, available);
+  if (!set) return [];
+  const orgSet = resolveEntity(CATALOGS.organizations, available);
   const filter = and(
-    cmp("Owner", "eq", odataGuid(orgKey)),
-    query ? contains("Description", query) : undefined,
+    orgSet ? cmp("Owner_Type", "eq", odataString(`StandardODATA.${orgSet}`)) : undefined,
+    cmp("DeletionMark", "eq", "false"),
   );
   try {
-    const { rows } = await fetchAll(conn.client, set, { filter, select: ["Ref_Key"] }, 5, 5);
-    return rows[0] ? String(rows[0]["Ref_Key"]) : undefined;
+    const { rows } = await fetchAll(
+      conn.client,
+      set,
+      { filter, select: ["Ref_Key", "Description", "НомерСчета", "Owner"] },
+      conn.behavior.pageSize,
+      200,
+    );
+    return rows
+      .filter((r) => String(r["Owner"] ?? "") === orgKey)
+      .map((r) => ({
+        ref: String(r["Ref_Key"] ?? ""),
+        name: String(r["Description"] ?? ""),
+        number: String(r["НомерСчета"] ?? ""),
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name, "ru"));
   } catch {
-    // Не удалось подобрать — не критично: 1С подставит счёт организации по умолчанию.
+    return [];
+  }
+}
+
+/** Основной банковский счёт организации (реквизит ОсновнойБанковскийСчет). */
+async function mainOrgBankAccount(conn: Connection, orgKey: string): Promise<string | undefined> {
+  const orgSet = resolveEntity(CATALOGS.organizations, await conn.available());
+  if (!orgSet) return undefined;
+  try {
+    const org = await conn.client.getEntity(
+      `${orgSet}(guid'${orgKey.replace(/[{}']/g, "")}')${buildQuery({ select: ["ОсновнойБанковскийСчет_Key"] })}`,
+    );
+    return refOrUndefined(org["ОсновнойБанковскийСчет_Key"]);
+  } catch {
     return undefined;
   }
 }
@@ -713,6 +790,15 @@ const expenseAccountField = z
   .describe(
     "Счёт расходов (себестоимости) — код как в 1С (напр. «90.02.1» или «90.02.2») либо Ref_Key. " +
       "Без указания берётся из регистра «Счета учёта номенклатуры», иначе 90.02.1.",
+  );
+
+const orgBankAccountField = z
+  .string()
+  .optional()
+  .describe(
+    "Банковский счёт организации — печатается в документе как реквизиты для оплаты. " +
+      "Название/номер счёта (напр. «Сбербанк» или «40802…») либо Ref_Key. " +
+      "Без указания берётся ОСНОВНОЙ счёт организации.",
   );
 
 /** Базовые поля позиции документа (без счетов учёта). */
@@ -1073,13 +1159,24 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         contractRef: z.string().optional().describe("Ref_Key договора (необязательно)"),
         date: z.string().optional().describe("Дата документа YYYY-MM-DD (по умолчанию сегодня)"),
         sumIncludesVat: z.boolean().default(true).describe("Сумма включает НДС"),
+        orgBankAccount: orgBankAccountField,
         // Счёт на оплату проводок не делает — счета учёта в его строках не нужны.
         lines: z.array(purchaseLine).min(1).describe("Позиции счёта"),
         confirm: confirmField,
       },
       outputSchema: createResultSchema,
     },
-    ({ database, organization, counterpartyRef, contractRef, date, sumIncludesVat, lines, confirm }) =>
+    ({
+      database,
+      organization,
+      counterpartyRef,
+      contractRef,
+      date,
+      sumIncludesVat,
+      orgBankAccount,
+      lines,
+      confirm,
+    }) =>
       guard("write.sales.create_invoice", async () => {
         const conn = ctx.db(database);
         const set = await requireEntity(
@@ -1088,6 +1185,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           "Документ «Счёт на оплату покупателю»",
         );
         const org = await resolveOrg(conn, organization);
+        const bank = await resolveOrgBankAccount(conn, org.key, orgBankAccount);
         const rows = buildInvoiceRows(lines);
         const payload = clean({
           Date: odataDate(date ? new Date(`${date}T00:00:00`) : new Date()),
@@ -1095,6 +1193,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           Организация_Key: org.key,
           Контрагент_Key: counterpartyRef,
           ДоговорКонтрагента_Key: contractRef,
+          // У счёта на оплату банковский счёт организации зовётся «Структурная единица».
+          СтруктурнаяЕдиница_Key: bank,
           СуммаВключаетНДС: sumIncludesVat,
           СуммаДокумента: rowsTotal(rows),
           Товары: rows,
@@ -1290,6 +1390,9 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
     lines: z.array(saleLine).min(1).describe("Позиции документа"),
     confirm: confirmField,
   };
+
+  /** Реализация: та же схема плюс банковский счёт организации (у возврата его нет). */
+  const shipmentDocInput = { ...salesDocInput, orgBankAccount: orgBankAccountField };
 
   server.registerTool(
     "write.purchase.create_purchase",
@@ -1541,7 +1644,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         "Документ НЕПРОВЕДЁННЫЙ; провести — вручную в 1С или post_document (тогда 1С сформирует проводки Дт 62 Кт 90, Дт 90 Кт 41 и др.). " +
         "Позиции могут нести content (Содержание строки — печатается в УПД) и свои счета доходов/расходов. " +
         "По умолчанию dry-run; создание — при confirm=true. Контрагент — покупатель, договор — вида «СПокупателем».",
-      inputSchema: salesDocInput,
+      inputSchema: shipmentDocInput,
       outputSchema: createResultSchema,
     },
     ({
@@ -1554,6 +1657,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       sumIncludesVat,
       incomeAccount,
       expenseAccount,
+      orgBankAccount,
       lines,
       confirm,
     }) =>
@@ -1562,6 +1666,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const set = await requireEntity(conn, DOCUMENTS.sales, "Документ «Реализация товаров и услуг»");
         const org = await resolveOrg(conn, organization);
         const warehouseKey = await resolveWarehouse(conn, warehouse);
+        const bank = await resolveOrgBankAccount(conn, org.key, orgBankAccount);
         const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "shipment", {
           income: incomeAccount,
           expense: expenseAccount,
@@ -1578,6 +1683,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             sumIncludesVat,
             lines,
             settlement,
+            bankAccountKey: bank,
             lineAccountsFor,
           },
           confirm,
@@ -1985,7 +2091,13 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         ensurePublished(await conn.available(), entitySet);
         const info = await getDocInfo(conn, entitySet, ref.replace(/[{}']/g, ""));
         if (info.posted) return fail("Документ проведён. Сначала отмените проведение, затем меняйте строки.");
-        const built = await buildSectionRows(conn, entitySet, info.orgKey, [...info.lines, line], info.section);
+        const built = await buildSectionRows(
+          conn,
+          entitySet,
+          info.orgKey,
+          [...info.lines, line],
+          info.section,
+        );
         if (!built)
           return fail(
             "Поддерживаются: счёт, поступление/реализация, акт услуг, возвраты, перемещение, оприходование, списание.",
@@ -2065,6 +2177,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         expenseAccount: expenseAccountField.describe(
           "Счёт расходов для ВСЕХ строк (напр. «90.02.2»); счёт в строке важнее",
         ),
+        orgBankAccount: orgBankAccountField,
         lines: z.array(lineObject).min(1).describe("Позиции-услуги"),
         confirm: confirmField,
       },
@@ -2079,6 +2192,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       sumIncludesVat,
       incomeAccount,
       expenseAccount,
+      orgBankAccount,
       lines,
       confirm,
     }) =>
@@ -2086,6 +2200,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const conn = ctx.db(database);
         const set = await requireEntity(conn, DOCUMENTS.sales, "Документ «Реализация товаров и услуг»");
         const org = await resolveOrg(conn, organization);
+        const bank = await resolveOrgBankAccount(conn, org.key, orgBankAccount);
         const { settlement, lineAccountsFor } = await goodsAccounts(conn, org.key, lines, "service", {
           income: incomeAccount,
           expense: expenseAccount,
@@ -2099,6 +2214,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           Контрагент_Key: counterpartyRef,
           ДоговорКонтрагента_Key: contractRef,
           СчетУчетаРасчетовСКонтрагентом_Key: settlement,
+          БанковскийСчетОрганизации_Key: bank,
           СуммаВключаетНДС: sumIncludesVat,
           СуммаДокумента: rowsTotal(rows),
           Услуги: rows,
