@@ -174,6 +174,7 @@ Claude: Готово: контрагент 00-000123, счёт № … (черн
 | `write.sales.create_issued_invoice` / `write.purchase.create_received_invoice` | Счёт-фактура выданный / полученный (на основании реализации / поступления) |
 | `write.entity.create_folder` / `write.entity.move_to_folder` | Папка (группа) справочника / перемещение в папку |
 | `write.counterparty.update_counterparty` / `write.catalog.update_nomenclature` / `write.entity.update_entity` | Изменение реквизитов (PATCH) |
+| `write.document.copy_document` | Документ по образцу существующего — со всеми реквизитами |
 | `write.document.update_document_lines` / `write.document.add_document_line` / `write.document.remove_document_line` | Редактирование строк документа |
 | `write.document.post_document` | Провести / отменить проведение (1С формирует проводки) |
 | `write.entity.mark_for_deletion` | Пометить на удаление / снять пометку (мягкое удаление) |
@@ -199,6 +200,12 @@ Claude: Готово: контрагент 00-000123, счёт № … (черн
 `update_document_lines` заменяет строки целиком, поэтому там их задают заново.
 Строки пишутся в ту табличную часть, которая у документа заполнена: у акта услуг это
 «Услуги», у товарного документа — «Товары».
+
+**Ежемесячно повторяющиеся документы** проще выставлять через
+`write.document.copy_document`: он берёт прошлый документ за образец и переносит все
+реквизиты, включая те, которых нет в схемах `create_*` — банковский счёт, ответственного,
+адрес доставки, доп. условия счёта. Меняются датой (`date`), реквизитами шапки (`fields`)
+и правками строк по номеру (`lines`).
 
 ---
 

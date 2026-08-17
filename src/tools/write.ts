@@ -569,6 +569,91 @@ async function getDocInfo(
   };
 }
 
+/**
+ * Реквизиты шапки, которые в копию не переносим: они принадлежат исходному
+ * документу. Number отсутствует намеренно — 1С автонумерует новый документ,
+ * только если Number не передан вовсе.
+ */
+const NOT_COPIED_DOC_FIELDS = [
+  "Ref_Key",
+  "Number",
+  "Posted",
+  "DeletionMark",
+  "DataVersion",
+  "СсылочныйИдентификатор",
+] as const;
+
+/**
+ * Поля строк ТЧ, которые не копируем: идентификаторы строк связывают строку с
+ * исходным документом и его «потомками» — в копии они должны быть своими.
+ */
+const NOT_COPIED_ROW_FIELDS = ["Ref_Key", "ИдентификаторСтроки", "ИдентификаторРодительскойСтроки"] as const;
+
+/**
+ * Готовит прочитанный документ к записи как нового: убирает служебные поля 1С,
+ * технические ключи OData (odata.metadata, *@navigationLinkUrl) и идентификаторы
+ * строк табличных частей. Остальное переносится как есть — в этом и смысл копии.
+ */
+export function stripForCopy(entity: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(entity)) {
+    if (key.startsWith("odata.") || key.includes("@")) continue;
+    if ((NOT_COPIED_DOC_FIELDS as readonly string[]).includes(key)) continue;
+    if (Array.isArray(value)) {
+      out[key] = value.map((row) => {
+        if (!row || typeof row !== "object") return row;
+        const copy: Record<string, unknown> = { ...(row as Record<string, unknown>) };
+        for (const f of NOT_COPIED_ROW_FIELDS) delete copy[f];
+        return copy;
+      });
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+/** Переопределение полей одной строки табличной части по её номеру. */
+export interface LineOverride {
+  lineNumber: number;
+  fields: Record<string, unknown>;
+}
+
+/**
+ * Применяет переопределения к строкам ТЧ по номеру строки. Номер, которого нет
+ * в документе, — ошибка ввода: молча проигнорировать правку суммы нельзя.
+ */
+export function applyLineOverrides(
+  rows: Array<Record<string, unknown>>,
+  overrides: LineOverride[],
+): Array<Record<string, unknown>> {
+  const byNumber = new Map(overrides.map((o) => [o.lineNumber, o.fields]));
+  const missing = overrides.filter((o) => o.lineNumber < 1 || o.lineNumber > rows.length);
+  if (missing.length) {
+    throw new InputError(
+      `В документе ${rows.length} строк(и), а правка задана для строки ${missing
+        .map((m) => m.lineNumber)
+        .join(", ")}.`,
+    );
+  }
+  return rows.map((row, i) => ({ ...row, ...(byNumber.get(i + 1) ?? {}) }));
+}
+
+/**
+ * Сумма документа по строкам ТЧ. undefined, если хотя бы у одной строки нет
+ * числовой «Суммы» — тогда пересчитывать нельзя и сумму оставляем исходную.
+ */
+export function totalFromRows(rows: Array<Record<string, unknown>>): number | undefined {
+  let sum = 0;
+  for (const row of rows) {
+    const v = row["Сумма"];
+    const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+    if (!Number.isFinite(n)) return undefined;
+    sum += n;
+  }
+  return Math.round(sum * 100) / 100;
+}
+
 /** Читает документ-основание счёта-фактуры: организация, контрагент, договор, суммы, НДС. */
 async function invoiceBasis(
   conn: Connection,
@@ -2110,6 +2195,81 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           { [info.section]: built.rows, СуммаДокумента: built.total },
           confirm,
         );
+      }),
+  );
+
+  server.registerTool(
+    "write.document.copy_document",
+    {
+      title: "Скопировать документ",
+      description:
+        "Создаёт новый документ по образцу существующего: читает его целиком и записывает копию " +
+        "со ВСЕМИ реквизитами — содержание строк, счета учёта, банковский счёт, ответственный, " +
+        "адрес доставки, доп. условия. Это главный способ выставить ежемесячно повторяющийся " +
+        "документ: инструменты create_* собирают документ из полей схемы и всё остальное теряют. " +
+        "Копия создаётся НЕПРОВЕДЁННОЙ, с новым номером (1С нумерует сама) и датой (по умолчанию сегодня). " +
+        "Правки: date — дата; fields — реквизиты шапки техническими именами (как в update_entity); " +
+        "lines — правки строк по номеру (напр. количество и содержание). Сумма документа " +
+        "пересчитывается по строкам, если не задана явно в fields. По умолчанию dry-run; запись — при confirm=true.",
+      inputSchema: {
+        database: databaseField,
+        entitySet: z.string().describe("Имя документа, напр. Document_СчетНаОплатуПокупателю"),
+        ref: z.string().describe("Ref_Key документа-образца (GUID)"),
+        date: z.string().optional().describe("Дата копии YYYY-MM-DD (по умолчанию сегодня)"),
+        fields: z
+          .record(z.union([z.string(), z.number(), z.boolean(), z.null()]))
+          .optional()
+          .describe(
+            'Реквизиты шапки, которые надо изменить: { техническоеИмя: значение }, напр. {"Комментарий":"..."}',
+          ),
+        lines: z
+          .array(
+            z.object({
+              lineNumber: z.number().int().positive().describe("Номер строки (с 1)"),
+              fields: z
+                .record(z.union([z.string(), z.number(), z.boolean(), z.null()]))
+                .describe(
+                  'Поля строки: { техническоеИмя: значение }, напр. {"Количество":4.3,"Сумма":10750,"Содержание":"..."}',
+                ),
+            }),
+          )
+          .optional()
+          .describe("Правки строк табличной части по номеру (остальные строки копируются как есть)"),
+        confirm: confirmField,
+      },
+      outputSchema: createResultSchema,
+    },
+    ({ database, entitySet, ref, date, fields, lines, confirm }) =>
+      guard("write.document.copy_document", async () => {
+        const conn = ctx.db(database);
+        ensurePublished(await conn.available(), entitySet);
+        const guid = ref.replace(/[{}']/g, "");
+        const source = await conn.client.getEntity(`${entitySet}(guid'${guid}')${buildQuery({})}`);
+        const payload = stripForCopy(source);
+        payload["Date"] = odataDate(date ? new Date(`${date}T00:00:00`) : new Date());
+        payload["Posted"] = false;
+
+        if (lines?.length) {
+          const section = pickSection(
+            {
+              goods: payload["Товары"] as unknown[] | undefined,
+              services: payload["Услуги"] as unknown[] | undefined,
+            },
+            {
+              servicesAct: (DOCUMENTS.servicesAct as readonly string[]).includes(entitySet),
+              operationKind: payload["ВидОперации"],
+            },
+          );
+          const rows = (payload[section] as Array<Record<string, unknown>>) ?? [];
+          if (rows.length === 0) return fail(`В документе нет строк табличной части «${section}».`);
+          const patched = applyLineOverrides(rows, lines);
+          payload[section] = patched;
+          const total = totalFromRows(patched);
+          if (total !== undefined) payload["СуммаДокумента"] = total;
+        }
+        // Реквизиты шапки применяем последними — явное указание важнее пересчёта.
+        Object.assign(payload, fields ?? {});
+        return createOrPreview(conn, entitySet, payload, confirm);
       }),
   );
 
