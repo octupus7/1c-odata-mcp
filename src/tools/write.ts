@@ -521,18 +521,48 @@ export function lineFromRow(r: Record<string, unknown>): GoodsLine {
   };
 }
 
-/** Читает документ: организация, проведён ли, и текущие строки «Товары» как GoodsLine[]. */
+/** Табличная часть документа, в которой лежат позиции. */
+export type Section = "Товары" | "Услуги";
+
+/**
+ * Определяет табличную часть документа. У реализации их две: «Товары» и «Услуги»,
+ * и заполнена ровно одна — акт услуг (ВидОперации=Услуги) живёт в «Услугах».
+ * Ориентируемся сперва на факт (где есть строки), затем на тип и вид операции —
+ * у пустого документа строк ещё нет.
+ */
+export function pickSection(
+  doc: { goods?: unknown[] | undefined; services?: unknown[] | undefined },
+  hints: { servicesAct: boolean; operationKind?: unknown },
+): Section {
+  if (doc.services?.length) return "Услуги";
+  if (doc.goods?.length) return "Товары";
+  if (hints.servicesAct) return "Услуги";
+  return hints.operationKind === "Услуги" ? "Услуги" : "Товары";
+}
+
+/** Читает документ: организация, проведён ли, заполненная ТЧ и её строки. */
 async function getDocInfo(
   conn: Connection,
   entitySet: string,
   guid: string,
-): Promise<{ orgKey: string; posted: boolean; lines: GoodsLine[] }> {
+): Promise<{ orgKey: string; posted: boolean; lines: GoodsLine[]; section: Section }> {
   const doc = await conn.client.getEntity(`${entitySet}(guid'${guid}')${buildQuery({})}`);
-  const rows = (doc["Товары"] as Array<Record<string, unknown>>) ?? [];
+  const section = pickSection(
+    {
+      goods: doc["Товары"] as unknown[] | undefined,
+      services: doc["Услуги"] as unknown[] | undefined,
+    },
+    {
+      servicesAct: (DOCUMENTS.servicesAct as readonly string[]).includes(entitySet),
+      operationKind: doc["ВидОперации"],
+    },
+  );
+  const rows = (doc[section] as Array<Record<string, unknown>>) ?? [];
   return {
     orgKey: String(doc["Организация_Key"] ?? ""),
     posted: doc["Posted"] === true,
     lines: rows.map(lineFromRow),
+    section,
   };
 }
 
@@ -555,16 +585,25 @@ async function invoiceBasis(
   };
 }
 
-/** Собирает строки табличной части под тип документа (счёт/поступление/реализация). */
+/**
+ * Собирает строки табличной части под тип документа (счёт/поступление/реализация/акт).
+ * section — куда пойдут строки: для «Услуг» счёт учёта 41 не ставится (склада нет).
+ */
 async function buildSectionRows(
   conn: Connection,
   entitySet: string,
   orgKey: string,
   lines: GoodsLine[],
+  section: Section,
 ): Promise<{ rows: Array<Record<string, unknown>>; total: number } | undefined> {
   const inList = (arr: readonly string[]): boolean => arr.includes(entitySet);
   if (inList(DOCUMENTS.customerInvoice)) {
     const rows = buildInvoiceRows(lines);
+    return { rows, total: rowsTotal(rows) };
+  }
+  if (inList(DOCUMENTS.servicesAct)) {
+    const { lineAccountsFor } = await goodsAccounts(conn, orgKey, lines, "service");
+    const rows = buildGoodsRows(lines, lineAccountsFor);
     return { rows, total: rowsTotal(rows) };
   }
   // Реализация/поступление и возвраты: возврат покупателя считается как реализация
@@ -575,7 +614,8 @@ async function buildSectionRows(
     inList(DOCUMENTS.returnFromCustomer) ||
     inList(DOCUMENTS.returnToSupplier)
   ) {
-    const kind = inList(DOCUMENTS.sales) || inList(DOCUMENTS.returnFromCustomer) ? "shipment" : "purchase";
+    const sale = inList(DOCUMENTS.sales) || inList(DOCUMENTS.returnFromCustomer);
+    const kind = sale ? (section === "Услуги" ? "service" : "shipment") : "purchase";
     const { lineAccountsFor } = await goodsAccounts(conn, orgKey, lines, kind);
     const rows = buildGoodsRows(lines, lineAccountsFor);
     return { rows, total: rowsTotal(rows) };
@@ -1551,7 +1591,9 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       title: "Изменить строки документа",
       description:
         "Заменяет табличную часть «Товары» существующего документа новым набором строк и пересчитывает сумму. " +
-        "Поддержаны: счёт покупателю, поступление, реализация. Документ должен быть НЕПРОВЕДЁННЫМ " +
+        "Поддержаны: счёт покупателю, поступление, реализация (и товарами, и услугами), акт об оказании услуг. " +
+        "Строки пишутся в ту табличную часть, которая у документа заполнена («Товары» или «Услуги»). " +
+        "Документ должен быть НЕПРОВЕДЁННЫМ " +
         "(если проведён — сначала отмените проведение через post_document). По умолчанию dry-run; применение — при confirm=true.",
       inputSchema: {
         database: databaseField,
@@ -1578,18 +1620,18 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
             "Документ проведён. Сначала отмените проведение (post_document с post=false), затем меняйте строки.",
           );
         }
-        const built = await buildSectionRows(conn, entitySet, info.orgKey, lines);
+        const built = await buildSectionRows(conn, entitySet, info.orgKey, lines, info.section);
         if (!built) {
           return fail(
-            "Поддерживаются: счёт покупателю, поступление/реализация товаров и услуг, возвраты, " +
-              "перемещение, оприходование, списание товаров.",
+            "Поддерживаются: счёт покупателю, поступление/реализация товаров и услуг, акт об оказании " +
+              "услуг, возвраты, перемещение, оприходование, списание товаров.",
           );
         }
         return patchOrPreview(
           conn,
           entitySet,
           ref,
-          { Товары: built.rows, СуммаДокумента: built.total },
+          { [info.section]: built.rows, СуммаДокумента: built.total },
           confirm,
         );
       }),
@@ -1943,16 +1985,16 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         ensurePublished(await conn.available(), entitySet);
         const info = await getDocInfo(conn, entitySet, ref.replace(/[{}']/g, ""));
         if (info.posted) return fail("Документ проведён. Сначала отмените проведение, затем меняйте строки.");
-        const built = await buildSectionRows(conn, entitySet, info.orgKey, [...info.lines, line]);
+        const built = await buildSectionRows(conn, entitySet, info.orgKey, [...info.lines, line], info.section);
         if (!built)
           return fail(
-            "Поддерживаются: счёт, поступление/реализация, возвраты, перемещение, оприходование, списание.",
+            "Поддерживаются: счёт, поступление/реализация, акт услуг, возвраты, перемещение, оприходование, списание.",
           );
         return patchOrPreview(
           conn,
           entitySet,
           ref,
-          { Товары: built.rows, СуммаДокумента: built.total },
+          { [info.section]: built.rows, СуммаДокумента: built.total },
           confirm,
         );
       }),
@@ -1984,16 +2026,16 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const kept = info.lines.filter((_, i) => i + 1 !== lineNumber);
         if (kept.length === 0)
           return fail("Нельзя удалить последнюю строку — в документе должна остаться хотя бы одна позиция.");
-        const built = await buildSectionRows(conn, entitySet, info.orgKey, kept);
+        const built = await buildSectionRows(conn, entitySet, info.orgKey, kept, info.section);
         if (!built)
           return fail(
-            "Поддерживаются: счёт, поступление/реализация, возвраты, перемещение, оприходование, списание.",
+            "Поддерживаются: счёт, поступление/реализация, акт услуг, возвраты, перемещение, оприходование, списание.",
           );
         return patchOrPreview(
           conn,
           entitySet,
           ref,
-          { Товары: built.rows, СуммаДокумента: built.total },
+          { [info.section]: built.rows, СуммаДокумента: built.total },
           confirm,
         );
       }),
