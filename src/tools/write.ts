@@ -1688,12 +1688,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         recipientKpp: z.string().optional().describe("КПП получателя"),
         payerText: z.string().optional().describe("Текст плательщика (по умолчанию — имя организации)"),
         payerInn: z.string().optional().describe("ИНН плательщика (по умолчанию — ИНН организации)"),
-        orgAccountRef: z
-          .string()
-          .optional()
-          .describe(
-            "Ref_Key счёта организации-плательщика (СчетОрганизации_Key); без указания — подбирается",
-          ),
+        orgBankAccount: orgBankAccountField,
         responsibleRef: z.string().optional().describe("Ref_Key ответственного (Ответственный_Key)"),
         cashflowItemRef: z
           .string()
@@ -1726,7 +1721,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       recipientKpp,
       payerText,
       payerInn,
-      orgAccountRef,
+      orgBankAccount,
       responsibleRef,
       cashflowItemRef,
       currencyRef,
@@ -1741,7 +1736,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const set = await requireEntity(conn, DOCUMENTS.paymentOrder, "Документ «Платёжное поручение»");
         const org = await resolveOrgOrDefault(conn, organization);
         const [resolvedOrgAccount, resolvedCurrency] = await Promise.all([
-          orgAccountRef ? Promise.resolve(orgAccountRef) : resolveOrgBankAccount(conn, org.ref, undefined),
+          // Через общий резолвер: принимает название/номер счёта, а не только Ref_Key.
+          resolveOrgBankAccount(conn, org.ref, orgBankAccount),
           currencyRef ? Promise.resolve(currencyRef) : resolveDefaultCurrency(conn),
         ]);
         const payload = clean({
@@ -2548,21 +2544,18 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         counterpartyRef: z.string().describe("Ref_Key покупателя"),
         contractRef: z.string().describe("Ref_Key договора"),
         amount: z.number().positive().describe("Сумма оплаты"),
-        bankAccount: z
-          .string()
-          .optional()
-          .describe("Название банковского счёта организации (если несколько)"),
+        orgBankAccount: orgBankAccountField,
         date: z.string().optional().describe("Дата YYYY-MM-DD (по умолчанию сегодня)"),
         confirm: confirmField,
       },
       outputSchema: createResultSchema,
     },
-    ({ database, organization, counterpartyRef, contractRef, amount, bankAccount, date, confirm }) =>
+    ({ database, organization, counterpartyRef, contractRef, amount, orgBankAccount, date, confirm }) =>
       guard("write.money.create_payment", async () => {
         const conn = ctx.db(database);
         const set = await requireEntity(conn, DOCUMENTS.bankIn, "Документ «Поступление на расчётный счёт»");
         const org = await resolveOrg(conn, organization);
-        const bank = await resolveOrgBankAccount(conn, org.key, bankAccount);
+        const bank = await resolveOrgBankAccount(conn, org.key, orgBankAccount);
         const codes = await accountsByCode(conn, ["62.01", "62", "62.02"]);
         const settle = pickAccount(codes, "62.01", "62");
         const advance = pickAccount(codes, "62.02");
@@ -2654,10 +2647,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         contractRef: z.string().optional().describe("Ref_Key договора (для расшифровки взаиморасчётов)"),
         purposeText: z.string().optional().describe("Назначение платежа (текст)"),
         cashflowItemRef: z.string().optional().describe("Ref_Key статьи ДДС"),
-        bankAccount: z
-          .string()
-          .optional()
-          .describe("Название банковского счёта организации (если несколько)"),
+        orgBankAccount: orgBankAccountField,
         date: z.string().optional().describe("Дата YYYY-MM-DD (по умолчанию сегодня)"),
         comment: z.string().optional().describe("Комментарий"),
         confirm: confirmField,
@@ -2673,7 +2663,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
       contractRef,
       purposeText,
       cashflowItemRef,
-      bankAccount,
+      orgBankAccount,
       date,
       comment,
       confirm,
@@ -2682,7 +2672,7 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
         const conn = ctx.db(database);
         const set = await requireEntity(conn, DOCUMENTS.bankOut, "Документ «Списание с расчётного счёта»");
         const org = await resolveOrg(conn, organization);
-        const bank = await resolveOrgBankAccount(conn, org.key, bankAccount);
+        const bank = await resolveOrgBankAccount(conn, org.key, orgBankAccount);
         const bd = await buildSettlementRow(conn, operationKind, contractRef, amount);
         const payload = clean({
           Date: odataDate(date ? new Date(`${date}T00:00:00`) : new Date()),
