@@ -225,7 +225,9 @@ type LineAccountsFor = (line: GoodsLine) => Record<string, string>;
 /** Счета в строке не заполняются (счёт поставщика, счёт покупателю — проводок нет). */
 const noAccounts: LineAccountsFor = () => ({});
 
-const lineSum = (l: GoodsLine): number => Math.round(l.quantity * l.price * 100) / 100;
+/** Округление денег до копеек — суммы складываем только через него. */
+const roundMoney = (n: number): number => Math.round(n * 100) / 100;
+const lineSum = (l: GoodsLine): number => roundMoney(l.quantity * l.price);
 const rowsTotal = (rows: Array<Record<string, unknown>>): number =>
   Math.round(rows.reduce((s, r) => s + (r["Сумма"] as number), 0) * 100) / 100;
 
@@ -236,13 +238,34 @@ const rowsTotal = (rows: Array<Record<string, unknown>>): number =>
 const NOT_CARRIED_ROW_FIELDS = ["LineNumber", "Сумма", "СуммаНДС", "СуммаСНДС", "Ref_Key"] as const;
 
 /**
+ * Слагаемые суммы НДС строки не изменились — значит прежняя сумма налога верна.
+ * Пересчитать её мы не можем: формула зависит от СуммаВключаетНДС документа и
+ * процента ставки, и угадывать тут нельзя. Но и терять нельзя — иначе у документа
+ * с НДС строка уезжает в 1С с нулевым налогом.
+ */
+function vatInputsUnchanged(l: GoodsLine): boolean {
+  const s = l.source;
+  if (!s) return false;
+  return (
+    Number(s["Количество"]) === l.quantity &&
+    Number(s["Цена"]) === l.price &&
+    String(s["СтавкаНДС"] ?? "БезНДС") === l.vatRate &&
+    // Сумму строки мы считаем как количество×цену. Если в исходной строке она была
+    // другой (ручная скидка в 1С), то и прежний налог посчитан не от нашей суммы.
+    Number(s["Сумма"]) === lineSum(l)
+  );
+}
+
+/**
  * Прочие поля исходной строки (номенклатурная группа, ГТД, страна происхождения,
  * субконто) — переносим как есть: мы ими не управляем, но терять их нельзя.
+ * СуммаНДС переносится только при неизменных количестве/цене/ставке.
  */
 export function carriedRowFields(l: GoodsLine): Record<string, unknown> {
   if (!l.source) return {};
   const out: Record<string, unknown> = { ...l.source };
   for (const f of NOT_CARRIED_ROW_FIELDS) delete out[f];
+  if (vatInputsUnchanged(l)) out["СуммаНДС"] = l.source["СуммаНДС"];
   return out;
 }
 
@@ -543,12 +566,39 @@ export function pickSection(
   return hints.operationKind === "Услуги" ? "Услуги" : "Товары";
 }
 
-/** Читает документ: организация, проведён ли, заполненная ТЧ и её строки. */
+/** Строки табличной части документа (пустой массив, если ТЧ нет или она пуста). */
+export function sectionRows(doc: Record<string, unknown>, section: Section): Array<Record<string, unknown>> {
+  return (doc[section] as Array<Record<string, unknown>> | undefined) ?? [];
+}
+
+/** Вторая табличная часть — та, которую сейчас не правим. */
+const otherSection = (s: Section): Section => (s === "Товары" ? "Услуги" : "Товары");
+
+/**
+ * Сумма «Сумма» по строкам. Документ может нести позиции в ОБЕИХ ТЧ (реализация
+ * с товарами и услугами), поэтому итог документа = правимая ТЧ + вторая как есть:
+ * считать только по одной значило бы занизить СуммаДокумента.
+ */
+export function rowsSum(rows: Array<Record<string, unknown>>): number {
+  return roundMoney(rows.reduce((s, r) => s + Number(r["Сумма"] ?? 0), 0));
+}
+
+/**
+ * Читает документ: организация, проведён ли, заполненная ТЧ и её строки.
+ * otherTotal — сумма ВТОРОЙ табличной части: её мы не трогаем, но в
+ * СуммаДокумента она входит (у реализации бывают заполнены и «Товары», и «Услуги»).
+ */
 async function getDocInfo(
   conn: Connection,
   entitySet: string,
   guid: string,
-): Promise<{ orgKey: string; posted: boolean; lines: GoodsLine[]; section: Section }> {
+): Promise<{
+  orgKey: string;
+  posted: boolean;
+  lines: GoodsLine[];
+  section: Section;
+  otherTotal: number;
+}> {
   const doc = await conn.client.getEntity(`${entitySet}(guid'${guid}')${buildQuery({})}`);
   const section = pickSection(
     {
@@ -560,12 +610,12 @@ async function getDocInfo(
       operationKind: doc["ВидОперации"],
     },
   );
-  const rows = (doc[section] as Array<Record<string, unknown>>) ?? [];
   return {
     orgKey: String(doc["Организация_Key"] ?? ""),
     posted: doc["Posted"] === true,
-    lines: rows.map(lineFromRow),
+    lines: sectionRows(doc, section).map(lineFromRow),
     section,
+    otherTotal: rowsSum(sectionRows(doc, otherSection(section))),
   };
 }
 
@@ -662,7 +712,9 @@ async function invoiceBasis(
 ): Promise<{ org: string; counterparty: string; contract?: string; total: number; vat: number }> {
   const guid = ref.replace(/[{}']/g, "");
   const doc = await conn.client.getEntity(`${entitySet}(guid'${guid}')${buildQuery({})}`);
-  const rows = (doc["Товары"] as Array<Record<string, unknown>>) ?? [];
+  // НДС собираем по ОБЕИМ табличным частям: акт услуг (create_act) живёт в
+  // «Услугах», и чтение одних «Товаров» давало счёт-фактуру с нулевым НДС.
+  const rows = [...sectionRows(doc, "Товары"), ...sectionRows(doc, "Услуги")];
   const vat = Math.round(rows.reduce((s, r) => s + Number(r["СуммаНДС"] ?? 0), 0) * 100) / 100;
   return {
     org: String(doc["Организация_Key"] ?? ""),
@@ -1823,7 +1875,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           conn,
           entitySet,
           ref,
-          { [info.section]: built.rows, СуммаДокумента: built.total },
+          // Вторая ТЧ остаётся как есть, но в сумму документа входит.
+          { [info.section]: built.rows, СуммаДокумента: roundMoney(built.total + info.otherTotal) },
           confirm,
         );
       }),
@@ -2192,7 +2245,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           conn,
           entitySet,
           ref,
-          { [info.section]: built.rows, СуммаДокумента: built.total },
+          // Вторая ТЧ остаётся как есть, но в сумму документа входит.
+          { [info.section]: built.rows, СуммаДокумента: roundMoney(built.total + info.otherTotal) },
           confirm,
         );
       }),
@@ -2260,12 +2314,16 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
               operationKind: payload["ВидОперации"],
             },
           );
-          const rows = (payload[section] as Array<Record<string, unknown>>) ?? [];
+          const rows = sectionRows(payload, section);
           if (rows.length === 0) return fail(`В документе нет строк табличной части «${section}».`);
           const patched = applyLineOverrides(rows, lines);
           payload[section] = patched;
           const total = totalFromRows(patched);
-          if (total !== undefined) payload["СуммаДокумента"] = total;
+          // Вторая ТЧ копируется как есть, но в сумму документа входит.
+          if (total !== undefined)
+            payload["СуммаДокумента"] = roundMoney(
+              total + rowsSum(sectionRows(payload, otherSection(section))),
+            );
         }
         // Реквизиты шапки применяем последними — явное указание важнее пересчёта.
         Object.assign(payload, fields ?? {});
@@ -2308,7 +2366,8 @@ export function registerWriteTools(server: McpServer, ctx: ServerContext): void 
           conn,
           entitySet,
           ref,
-          { [info.section]: built.rows, СуммаДокумента: built.total },
+          // Вторая ТЧ остаётся как есть, но в сумму документа входит.
+          { [info.section]: built.rows, СуммаДокумента: roundMoney(built.total + info.otherTotal) },
           confirm,
         );
       }),

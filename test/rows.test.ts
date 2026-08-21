@@ -113,7 +113,9 @@ describe("lineFromRow + carriedRowFields", () => {
   it("переносит неуправляемые поля строки и отбрасывает пересчитываемые", () => {
     const carried = carriedRowFields(lineFromRow(row));
     expect(carried["НоменклатурнаяГруппа_Key"]).toBe("grp-1");
-    expect(carried).not.toHaveProperty("СуммаНДС");
+    // Количество/цена/ставка не менялись — прежний налог верен и переносится
+    // (иначе строка документа с НДС уехала бы в 1С с нулевым налогом).
+    expect(carried["СуммаНДС"]).toBe(8333.33);
     expect(carried).not.toHaveProperty("Сумма");
     expect(carried).not.toHaveProperty("LineNumber");
     expect(carried).not.toHaveProperty("Ref_Key");
@@ -129,9 +131,11 @@ describe("lineFromRow + carriedRowFields", () => {
     expect(rows[0]?.["Содержание"]).toBe("Услуги по договору № 87");
     expect(rows[0]?.["НоменклатурнаяГруппа_Key"]).toBe("grp-1");
     expect(rows[0]?.["LineNumber"]).toBe(1);
-    expect(rows[0]).not.toHaveProperty("СуммаНДС");
+    // Прежняя строка не тронута — её налог сохраняется; у новой строки его нет.
+    expect(rows[0]?.["СуммаНДС"]).toBe(8333.33);
     expect(rows[1]?.["Номенклатура_Key"]).toBe("nom-new");
     expect(rows[1]?.["LineNumber"]).toBe(2);
+    expect(rows[1]).not.toHaveProperty("СуммаНДС");
   });
 
   it("не затирает перенесённое содержание, если content в строке не задан", () => {
